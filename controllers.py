@@ -1,329 +1,227 @@
 # controllers.py
-# Manages the application logic, state, and connects views with models.
+# Manages application logic, state, and connects views with models.
 
-import sys
-import json
 import logging
+from tkinter import messagebox
+import queue
 import os
-from PyQt6.QtWidgets import QMessageBox
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+
 from models import DatabaseManager, WishlistManager, DataWorker
-from views import MainView, AuthDialog, PetDetailsDialog, AdoptionFormDialog, ServiceDetailsDialog, ScheduleDialog, ConfirmationDialog
+from views import MainView, AuthDialog, PetDetailsDialog
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-class AppController(QObject):
-    """
-    Main application controller managing state and UI flow.
-    """
-    
-    # State Machine
-    STATES = {
-        'guest_home': 0,
-        'guest_pet_list': 1,
-        'guest_service_list': 2,
-        'pet_details': 3,
-        'service_details': 4,
-        'login': 5,
-        'signup': 6,
-        'adoption_form': 7,
-        'booking_schedule': 8,
-        'payment': 9,
-        'confirmation': 10,
-        'user_dashboard': 11
-    }
-    
-    BREADCRUMBS = {
-        'adoption_track': ["Home", "Browse Pets", "Pet Details", "Adoption Application", "Payment", "Confirmation"],
-        'booking_track': ["Home", "Browse Services", "Service Details", "Schedule", "Booking Form", "Payment", "Confirmation"]
-    }
+class AppController:
+    """Main application controller managing state and UI flow."""
     
     def __init__(self, view: MainView, db: DatabaseManager, wishlist_manager: WishlistManager):
-        super().__init__()
         self.view = view
         self.db = db
         self.wishlist_manager = wishlist_manager
         
         self.user_id = None
         self.username = "Guest"
-        self.current_state = self.STATES['guest_home']
-        self.current_flow = None # 'adoption' or 'booking'
         self.current_item = None # The pet or service being processed
-        
         self.pending_action = None
         
-        self.data_worker = None
+        # Queue for thread-safe communication
+        self.data_queue = queue.Queue()
         
-        self.connect_signals()
+        self.setup_callbacks()
         self.update_ui_for_state()
 
         # Initial data load
         self.load_pet_data()
         self.load_service_data()
         
-    def connect_signals(self):
-        """Connects signals from the view to controller slots."""
-        self.view.home_view.findChild(QPushButton, "See All Pets").clicked.connect(self.show_pet_list)
-        self.view.home_view.findChild(QPushButton, "See All Services").clicked.connect(self.show_service_list)
-        self.view.pet_list_view.findChild(QPushButton, "Search").clicked.connect(self.on_pet_search)
-        self.view.service_list_view.findChild(QPushButton, "Search").clicked.connect(self.on_service_search)
-        self.view.auth_button.clicked.connect(self.show_auth_dialog)
+        # Start the queue listener
+        self.view.after(100, self.process_queue)
 
-    def load_pet_data(self):
-        """Fetches pet data from the database in a separate thread."""
-        self.start_worker_thread('get_pets')
+    def setup_callbacks(self):
+        """Assigns controller methods to view widget commands."""
+        # --- Main View ---
+        self.view.auth_button.configure(command=self.auth_button_action)
         
-    def load_service_data(self):
-        """Fetches service data from the database in a separate thread."""
-        self.start_worker_thread('get_services')
+        # --- Home Page ---
+        home_page = self.view.frames["HomePage"]
+        home_page.pets_section.see_all_button.configure(command=self.show_pet_list)
+        home_page.services_section.see_all_button.configure(command=self.show_service_list)
+        
+        # --- Pet List Page ---
+        pet_page = self.view.frames["PetListPage"]
+        pet_page.home_button.configure(command=self.show_home)
+        pet_page.search_button.configure(command=self.on_pet_search)
 
-    def start_worker_thread(self, operation, **kwargs):
-        """Starts a DataWorker thread for a given operation."""
-        if self.data_worker and self.data_worker.isRunning():
-            return
+        # --- Service List Page ---
+        service_page = self.view.frames["ServiceListPage"]
+        service_page.home_button.configure(command=self.show_home)
+        service_page.search_button.configure(command=self.on_service_search)
         
-        self.data_worker = DataWorker(self.db, operation, **kwargs)
-        self.data_worker.result_ready.connect(self.handle_worker_result)
-        self.data_worker.error_occurred.connect(self.handle_worker_error)
-        self.data_worker.finished.connect(self.on_worker_finished)
-        self.data_worker.start()
-        
-    def handle_worker_result(self, result_type, data):
-        """Handles results from the DataWorker thread."""
-        if result_type == 'pets_list':
-            self.view.display_pets(data)
-        elif result_type == 'services_list':
-            self.view.display_services(data)
-        elif result_type == 'auth_result':
-            self.on_login_result(data)
-        elif result_type == 'signup_result':
-            self.on_signup_result(data)
-        elif result_type == 'wishlist_result':
-            # Handle syncing the wishlist on login
-            if self.pending_action == 'sync_wishlist' and data:
-                for pet in data:
-                    self.db.add_to_wishlist(self.user_id, pet['id'])
-                os.remove(self.wishlist_manager.filename)
-                self.pending_action = None
-            
-    def handle_worker_error(self, operation, error_msg):
-        """Handles errors from the DataWorker thread."""
-        logging.error(f"Worker thread for '{operation}' failed: {error_msg}")
-        QMessageBox.warning(self.view, "Database Error", "An error occurred while accessing the database.")
+    def process_queue(self):
+        """Processes results from the data worker thread queue."""
+        try:
+            while not self.data_queue.empty():
+                operation, data = self.data_queue.get_nowait()
+                
+                if isinstance(data, Exception):
+                    logging.error(f"Worker thread for '{operation}' failed: {data}")
+                    messagebox.showerror("Database Error", "An error occurred while accessing the database.")
+                    continue
 
-    def on_worker_finished(self):
-        """Cleans up the worker thread."""
-        self.data_worker = None
+                if operation == 'get_pets':
+                    self.view.frames["HomePage"].clear_grid(self.view.frames["HomePage"].pet_grid)
+                    self.view.frames["PetListPage"].clear_grid(self.view.frames["PetListPage"].pet_grid)
+                    self.populate_pet_grids(data)
+                elif operation == 'get_services':
+                    self.view.frames["HomePage"].clear_grid(self.view.frames["HomePage"].service_grid)
+                    self.view.frames["ServiceListPage"].clear_grid(self.view.frames["ServiceListPage"].service_grid)
+                    self.populate_service_grids(data)
+                elif operation == 'verify_user':
+                    self.on_login_result(data)
+                elif operation == 'add_user':
+                    self.on_signup_result(data)
+        finally:
+            self.view.after(100, self.process_queue)
+    
+    def start_worker(self, operation, **kwargs):
+        """Starts a DataWorker thread."""
+        worker = DataWorker(self.db, operation, self.data_queue, **kwargs)
+        worker.start()
+
+    def load_pet_data(self, query=None):
+        """Fetches pet data from the database."""
+        self.start_worker('get_pets', query=query)
         
+    def load_service_data(self, query=None):
+        """Fetches service data from the database."""
+        self.start_worker('get_services', query=query)
+
+    def populate_pet_grids(self, pet_list):
+        """Populates both home and list pet grids with cards."""
+        home_grid = self.view.frames["HomePage"].pet_grid
+        list_grid = self.view.frames["PetListPage"].pet_grid
+
+        # Display first 4 on home page
+        for i, pet in enumerate(pet_list[:4]):
+            card = self.view.PetCard(home_grid, pet, self.on_pet_card_click)
+            card.grid(row=0, column=i, padx=10, pady=10)
+
+        # Display all on the list page
+        cols = 4
+        for i, pet in enumerate(pet_list):
+            card = self.view.PetCard(list_grid, pet, self.on_pet_card_click)
+            card.grid(row=i // cols, column=i % cols, padx=10, pady=10)
+    
+    def populate_service_grids(self, service_list):
+        """Populates both home and list service grids with cards."""
+        home_grid = self.view.frames["HomePage"].service_grid
+        list_grid = self.view.frames["ServiceListPage"].service_grid
+
+        for i, service in enumerate(service_list[:4]):
+            card = self.view.ServiceCard(home_grid, service, self.on_service_card_click)
+            card.grid(row=0, column=i, padx=10, pady=10, sticky="nsew")
+
+        cols = 4
+        for i, service in enumerate(service_list):
+            card = self.view.ServiceCard(list_grid, service, self.on_service_card_click)
+            card.grid(row=i // cols, column=i % cols, padx=10, pady=10, sticky="nsew")
+
     def update_ui_for_state(self):
-        """Updates UI elements based on the current state."""
-        self.view.progress_frame.setVisible(self.current_state > self.STATES['guest_home'])
+        """Updates UI elements based on login state."""
+        self.view.user_label.configure(text=self.username)
+        self.view.auth_button.configure(text="Logout" if self.user_id else "Login / Signup")
 
-        if self.current_flow == 'adoption':
-            steps = self.BREADCRUMBS['adoption_track']
-            progress_percent = int((self.current_state - self.STATES['guest_home']) / (len(steps) - 1) * 100)
-        elif self.current_flow == 'booking':
-            steps = self.BREADCRUMBS['booking_track']
-            progress_percent = int((self.current_state - self.STATES['guest_home']) / (len(steps) - 1) * 100)
+    def auth_button_action(self):
+        """Handles click on the main auth button (Login or Logout)."""
+        if self.user_id:
+            self.logout()
         else:
-            steps = ["Home"]
-            progress_percent = 0
-            
-        self.view.breadcrumbs.set_steps(steps)
-        self.view.progress_bar.setValue(progress_percent)
+            self.show_auth_dialog()
 
-        self.view.user_label.setText(self.username)
-        self.view.auth_button.setText("Logout" if self.user_id else "Login / Signup")
-        self.view.auth_button.clicked.disconnect()
-        self.view.auth_button.clicked.connect(self.logout if self.user_id else self.show_auth_dialog)
-
-    def on_pet_card_click(self, pet_data):
-        """Handles click on a pet card."""
-        self.current_flow = 'adoption'
-        self.current_item = pet_data
-        self.current_state = self.STATES['pet_details']
-        self.update_ui_for_state()
-        
-        dialog = PetDetailsDialog(pet_data, self.view)
-        dialog.adopt_pet.connect(self.on_adopt_click)
-        dialog.exec()
-        
-    def on_service_card_click(self, service_data):
-        """Handles click on a service card."""
-        self.current_flow = 'booking'
-        self.current_item = service_data
-        self.current_state = self.STATES['service_details']
-        self.update_ui_for_state()
-
-        dialog = ServiceDetailsDialog(service_data, self.view)
-        dialog.book_service.connect(self.on_book_click)
-        dialog.exec()
-        
     def show_auth_dialog(self):
-        """Displays the authentication dialog."""
         dialog = AuthDialog(self.view)
-        dialog.login_attempt.connect(self.on_login_attempt)
-        dialog.signup_attempt.connect(self.on_signup_attempt)
-        dialog.exec()
-        
+        dialog.controller_callbacks['login'] = self.on_login_attempt
+        dialog.controller_callbacks['signup'] = self.on_signup_attempt
+        self.auth_dialog = dialog # Keep a reference
+
     def on_login_attempt(self, username, password):
-        """Initiates a login attempt."""
-        self.start_worker_thread('verify_user', username=username, password=password)
+        if not username or not password:
+            messagebox.showwarning("Login Failed", "Please enter both username and password.", parent=self.auth_dialog)
+            return
+        self.start_worker('verify_user', username=username, password=password)
         
     def on_login_result(self, user_id):
-        """Handles the result of a login attempt."""
         if user_id:
             self.user_id = user_id
-            self.username = self.db.get_user_by_id(user_id)['username']
-            QMessageBox.information(self.view, "Success", f"Welcome back, {self.username}!")
+            user_data = self.db.get_user_by_id(user_id)
+            self.username = user_data['username']
+            self.auth_dialog.destroy()
+            messagebox.showinfo("Success", f"Welcome back, {self.username}!")
             self.update_ui_for_state()
-            self.view.auth_dialog.accept()
-            # If there's a pending action, redirect to it
             if self.pending_action == 'adopt':
                 self.show_adoption_form()
-            elif self.pending_action == 'book':
-                self.show_schedule_dialog()
-            # Check for guest wishlist to sync
-            if os.path.exists(self.wishlist_manager.filename):
-                self.pending_action = 'sync_wishlist'
-                guest_wishlist = self.wishlist_manager.load_wishlist()
-                if guest_wishlist:
-                    for pet_id in guest_wishlist:
-                        self.db.add_to_wishlist(self.user_id, pet_id)
-                    os.remove(self.wishlist_manager.filename)
-                    QMessageBox.information(self.view, "Wishlist Synced", "Your guest wishlist has been synced to your account!")
-
+            self.pending_action = None
         else:
-            self.view.auth_dialog.login_error_label.setText("Invalid username or password.")
+            messagebox.showerror("Login Failed", "Invalid username or password.", parent=self.auth_dialog)
             
     def on_signup_attempt(self, username, email, password):
-        """Initiates a signup attempt."""
-        self.start_worker_thread('add_user', username=username, email=email, password=password)
+        if not all([username, email, password]):
+            messagebox.showwarning("Signup Failed", "Please fill all fields.", parent=self.auth_dialog)
+            return
+        self.start_worker('add_user', username=username, email=email, password=password)
         
     def on_signup_result(self, success):
-        """Handles the result of a signup attempt."""
         if success:
-            QMessageBox.information(self.view, "Success", "Account created! Please log in.")
-            self.view.auth_dialog.tab_widget.setCurrentIndex(0) # Switch to login tab
+            messagebox.showinfo("Success", "Account created successfully! Please log in.", parent=self.auth_dialog)
+            self.auth_dialog.tab_view.set("Login") # Switch to login tab
         else:
-            self.view.auth_dialog.signup_error_label.setText("Username or email already exists.")
+            messagebox.showerror("Signup Failed", "Username or email already exists.", parent=self.auth_dialog)
             
     def logout(self):
-        """Logs the current user out."""
         self.user_id = None
         self.username = "Guest"
-        self.current_state = self.STATES['guest_home']
-        self.current_flow = None
-        self.current_item = None
-        self.view.show_home_view()
         self.update_ui_for_state()
-        QMessageBox.information(self.view, "Logged Out", "You have been logged out.")
+        self.show_home()
+        messagebox.showinfo("Logged Out", "You have been successfully logged out.")
+
+    def on_pet_card_click(self, pet_data):
+        self.current_item = pet_data
+        PetDetailsDialog(self.view, pet_data, adopt_callback=self.on_adopt_click)
         
+    def on_service_card_click(self, service_data):
+        self.current_item = service_data
+        messagebox.showinfo("Service Details", f"Details for {service_data['name']}\n\nThis would open a details dialog.")
+
     def on_adopt_click(self, pet_data):
-        """Handles the 'Adopt' button click, checks for auth."""
         if not self.user_id:
             self.pending_action = 'adopt'
-            self.view.auth_dialog = AuthDialog(self.view)
-            self.view.auth_dialog.login_attempt.connect(self.on_login_attempt)
-            self.view.auth_dialog.signup_attempt.connect(self.on_signup_attempt)
-            self.view.auth_dialog.exec()
+            messagebox.showinfo("Login Required", "Please log in or create an account to adopt a pet.")
+            self.show_auth_dialog()
         else:
             self.show_adoption_form()
-    
-    def on_book_click(self, service_data):
-        """Handles the 'Book' button click, checks for auth."""
-        if not self.user_id:
-            self.pending_action = 'book'
-            self.view.auth_dialog = AuthDialog(self.view)
-            self.view.auth_dialog.login_attempt.connect(self.on_login_attempt)
-            self.view.auth_dialog.signup_attempt.connect(self.on_signup_attempt)
-            self.view.auth_dialog.exec()
-        else:
-            self.show_schedule_dialog()
 
     def show_adoption_form(self):
-        """Shows the adoption application form."""
-        self.current_state = self.STATES['adoption_form']
-        self.update_ui_for_state()
-        dialog = AdoptionFormDialog(self.current_item, self.view)
-        dialog.form_submitted.connect(self.on_adoption_form_submitted)
-        dialog.exec()
-        
-    def on_adoption_form_submitted(self, form_data):
-        """Handles a completed adoption form."""
-        QMessageBox.information(self.view, "Payment", "Payment placeholder. Proceeding to confirmation.")
-        self.db.add_adopted_pet(self.user_id, self.current_item['id'])
-        self.show_confirmation_dialog("Your adoption application has been submitted successfully!")
+        # Placeholder for adoption form logic
+        pet_name = self.current_item['name']
+        res = messagebox.askyesno("Confirm Adoption", f"Are you sure you want to proceed with adopting {pet_name}?")
+        if res:
+            self.db.add_adopted_pet(self.user_id, self.current_item['id'])
+            messagebox.showinfo("Success", f"Your adoption application for {pet_name} has been submitted!")
+            self.show_home()
 
-    def show_schedule_dialog(self):
-        """Shows the service scheduling dialog."""
-        self.current_state = self.STATES['booking_schedule']
-        self.update_ui_for_state()
-        dialog = ScheduleDialog(self.view)
-        dialog.schedule_selected.connect(self.on_schedule_selected)
-        dialog.exec()
-        
-    def on_schedule_selected(self, date_str):
-        """Handles a selected booking date."""
-        QMessageBox.information(self.view, "Booking", "Booking form and payment placeholder. Proceeding to confirmation.")
-        self.db.add_booking(self.user_id, self.current_item['id'], date_str)
-        self.show_confirmation_dialog("Your service booking is confirmed!")
-        
-    def show_confirmation_dialog(self, message):
-        """Shows the final confirmation dialog."""
-        self.current_state = self.STATES['confirmation']
-        self.update_ui_for_state()
-        dialog = ConfirmationDialog(message, self.view)
-        dialog.exec()
-        self.reset_to_home()
-
-    def reset_to_home(self):
-        """Resets the application state back to the home view."""
-        self.current_state = self.STATES['guest_home']
-        self.current_flow = None
-        self.current_item = None
-        self.update_ui_for_state()
-        self.view.show_home_view()
-
-    def show_pet_list(self):
-        """Switches to the pet list view and updates state."""
-        self.current_state = self.STATES['guest_pet_list']
-        self.current_flow = 'adoption'
-        self.update_ui_for_state()
-        self.view.show_pet_list_view()
-        self.view.clear_grid_layout(self.view.pet_grid_layout)
-        self.load_pet_data()
-        
-    def show_service_list(self):
-        """Switches to the service list view and updates state."""
-        self.current_state = self.STATES['guest_service_list']
-        self.current_flow = 'booking'
-        self.update_ui_for_state()
-        self.view.show_service_list_view()
-        self.view.clear_grid_layout(self.view.service_grid_layout)
-        self.load_service_data()
-        
     def on_pet_search(self):
-        """Handles the pet search button click."""
-        query = self.view.pet_list_view.findChild(QLineEdit).text()
-        # In a full app, we would also get filters.
-        self.start_worker_thread('get_pets', query=query)
+        query = self.view.frames["PetListPage"].search_entry.get()
+        self.load_pet_data(query=query)
         
     def on_service_search(self):
-        """Handles the service search button click."""
-        query = self.view.service_list_view.findChild(QLineEdit).text()
-        self.start_worker_thread('get_services', query=query)
-        
-    def on_home_view_pet_card_clicked(self, event):
-        """Handles clicks on pet cards in the home view's grid."""
-        widget = self.view.pets_section.findChild(QGridLayout).itemAt(0).widget().childAt(event.pos())
-        if isinstance(widget, PetCard):
-            self.on_pet_card_click(widget.pet_data)
+        query = self.view.frames["ServiceListPage"].search_entry.get()
+        self.load_service_data(query=query)
 
-    def on_home_view_service_card_clicked(self, event):
-        """Handles clicks on service cards in the home view's grid."""
-        widget = self.view.services_section.findChild(QGridLayout).itemAt(0).widget().childAt(event.pos())
-        if isinstance(widget, ServiceCard):
-            self.on_service_card_click(widget.service_data)
-      
+    def show_home(self):
+        self.view.show_frame("HomePage")
+        
+    def show_pet_list(self):
+        self.view.show_frame("PetListPage")
+        self.load_pet_data()
+
+    def show_service_list(self):
+        self.view.show_frame("ServiceListPage")
+        self.load_service_data()
