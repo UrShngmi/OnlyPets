@@ -4,8 +4,8 @@
 import sqlite3
 import json
 import logging
+import threading
 from passlib.hash import argon2
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,150 +14,133 @@ class DatabaseManager:
     """Handles all SQLite database connections and operations."""
 
     def __init__(self, db_name="onlypets.db"):
-        """Initializes the database manager and creates tables if they don't exist."""
+        """Initializes the database manager."""
         self.db_name = db_name
         self.conn = None
+        # Use a thread-local connection object for thread safety
+        self.local = threading.local()
 
-    def connect(self):
-        """Establishes a connection to the database."""
+    def get_conn(self):
+        """Gets a database connection for the current thread."""
+        if not hasattr(self.local, 'conn'):
+            try:
+                self.local.conn = sqlite3.connect(self.db_name)
+                self.local.conn.row_factory = sqlite3.Row
+                logging.info("New database connection for thread %s.", threading.current_thread().name)
+            except sqlite3.Error as e:
+                logging.error(f"Database connection error: {e}")
+                return None
+        return self.local.conn
+
+    def close_conn(self):
+        """Closes the database connection for the current thread."""
+        if hasattr(self.local, 'conn') and self.local.conn:
+            self.local.conn.close()
+            logging.info("Database connection closed for thread %s.", threading.current_thread().name)
+
+    def _execute_query(self, query, params=(), fetch=None):
+        """
+        Internal helper to execute a query.
+        'fetch' can be 'one', 'all', or None.
+        """
+        conn = self.get_conn()
+        if not conn:
+            return None
         try:
-            self.conn = sqlite3.connect(self.db_name)
-            self.conn.row_factory = sqlite3.Row  # Allows accessing columns by name
-            logging.info("Database connection successful.")
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Database connection error: {e}")
-            return False
-
-    def close(self):
-        """Closes the database connection."""
-        if self.conn:
-            self.conn.close()
-            logging.info("Database connection closed.")
-
-    def _execute_query(self, query, params=()):
-        """Internal helper to execute a query and handle common errors."""
-        try:
-            cursor = self.conn.cursor()
+            cursor = conn.cursor()
             cursor.execute(query, params)
-            self.conn.commit()
-            return cursor
+            if fetch == 'one':
+                result = cursor.fetchone()
+                return dict(result) if result else None
+            elif fetch == 'all':
+                results = cursor.fetchall()
+                return [dict(row) for row in results]
+            else:
+                conn.commit()
+                return cursor.lastrowid
         except sqlite3.Error as e:
             logging.error(f"SQLite query error: {e}")
             return None
 
     def create_tables(self):
-        """Creates the necessary database tables (pets, services, users, wishlists, adoptions, bookings)."""
-        if not self.conn:
-            logging.error("Database not connected. Cannot create tables.")
-            return
-
+        """Creates the necessary database tables."""
         queries = [
             """
             CREATE TABLE IF NOT EXISTS pets (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                breed TEXT NOT NULL,
-                age INTEGER NOT NULL,
-                description TEXT,
-                image_path TEXT
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, breed TEXT NOT NULL,
+                age INTEGER NOT NULL, description TEXT, image_path TEXT
             );""",
             """
             CREATE TABLE IF NOT EXISTS services (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                price REAL
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT, price REAL
             );""",
             """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL
+                id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL
             );""",
             """
             CREATE TABLE IF NOT EXISTS user_wishlist (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                pet_id INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (pet_id) REFERENCES pets(id)
+                id INTEGER PRIMARY KEY, user_id INTEGER, pet_id INTEGER,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (pet_id) REFERENCES pets(id)
             );""",
             """
             CREATE TABLE IF NOT EXISTS user_adoptions (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                pet_id INTEGER,
-                adoption_date TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (pet_id) REFERENCES pets(id)
+                id INTEGER PRIMARY KEY, user_id INTEGER, pet_id INTEGER, adoption_date TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (pet_id) REFERENCES pets(id)
             );""",
             """
             CREATE TABLE IF NOT EXISTS user_bookings (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                service_id INTEGER,
-                booking_date TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (service_id) REFERENCES services(id)
+                id INTEGER PRIMARY KEY, user_id INTEGER, service_id INTEGER, booking_date TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (service_id) REFERENCES services(id)
             );"""
         ]
         for query in queries:
             self._execute_query(query)
+        logging.info("Database tables checked/created.")
 
     def populate_sample_data(self):
-        """Populates the database with initial sample data."""
-        pets_data = [
-            ("Buddy", "Golden Retriever", 3, "A friendly and playful dog, loves long walks.", "p1.jpg"),
-            ("Whiskers", "Tabby Cat", 2, "An independent cat who enjoys sunbathing.", "p2.jpg"),
-            ("Max", "German Shepherd", 5, "Loyal and energetic, would be a great running partner.", "p3.jpg"),
-            ("Luna", "Siamese Cat", 1, "A curious kitten who loves to play with toys.", "p4.jpg"),
-            ("Rocky", "Labrador", 4, "A sweet and gentle giant, good with kids.", "p5.jpg"),
-            ("Milo", "Beagle", 2, "A happy and outgoing dog, always ready for an adventure.", "p6.jpg"),
-            ("Chloe", "Persian Cat", 3, "An elegant and calm cat, enjoys quiet afternoons.", "p7.jpg"),
-            ("Daisy", "Poodle", 1, "A smart and mischievous pup, loves learning new tricks.", "p8.jpg"),
-            ("Zoe", "Dachshund", 6, "A spirited and brave little dog, full of personality.", "p9.jpg"),
-            ("Oliver", "Maine Coon", 4, "A large and gentle cat, very affectionate.", "p10.jpg"),
-        ]
-        self._execute_query("INSERT OR IGNORE INTO pets (name, breed, age, description, image_path) VALUES (?, ?, ?, ?, ?)", pets_data)
+        """Populates the database with initial sample data if tables are empty."""
+        if not self._execute_query("SELECT id FROM pets LIMIT 1;", fetch='one'):
+            pets_data = [
+                ("Buddy", "Golden Retriever", 3, "A friendly and playful dog.", "p1.jpg"),
+                ("Whiskers", "Tabby Cat", 2, "An independent cat who enjoys sunbathing.", "p2.jpg"),
+                ("Max", "German Shepherd", 5, "Loyal and energetic.", "p3.jpg"),
+                ("Luna", "Siamese Cat", 1, "A curious kitten who loves to play.", "p4.jpg"),
+                ("Rocky", "Labrador", 4, "A sweet and gentle giant.", "p5.jpg"),
+                ("Milo", "Beagle", 2, "A happy and outgoing dog.", "p6.jpg"),
+                ("Chloe", "Persian Cat", 3, "An elegant and calm cat.", "p7.jpg"),
+                ("Daisy", "Poodle", 1, "A smart and mischievous pup.", "p8.jpg"),
+                ("Zoe", "Dachshund", 6, "A spirited and brave little dog.", "p9.jpg"),
+                ("Oliver", "Maine Coon", 4, "A large and gentle cat.", "p10.jpg"),
+            ]
+            for pet in pets_data:
+                self._execute_query("INSERT INTO pets (name, breed, age, description, image_path) VALUES (?, ?, ?, ?, ?)", pet)
+            logging.info("Sample pet data populated.")
 
-        services_data = [
-            ("Grooming", "Full grooming service including bath, trim, and nail clipping.", 50.00),
-            ("Vet Checkup", "Comprehensive health checkup by a licensed veterinarian.", 75.00),
-            ("Pet Training", "Basic obedience training for dogs of all ages.", 150.00),
-            ("Daycare", "Supervised daily care for your pet while you're away.", 30.00),
-            ("Boarding", "Overnight care and comfortable lodging for your pet.", 40.00),
-        ]
-        self._execute_query("INSERT OR IGNORE INTO services (name, description, price) VALUES (?, ?, ?)", services_data)
+        if not self._execute_query("SELECT id FROM services LIMIT 1;", fetch='one'):
+            services_data = [
+                ("Grooming", "Full grooming service.", 50.00),
+                ("Vet Checkup", "Comprehensive health checkup.", 75.00),
+                ("Pet Training", "Basic obedience training.", 150.00),
+                ("Daycare", "Supervised daily care.", 30.00),
+                ("Boarding", "Overnight care and lodging.", 40.00),
+            ]
+            for service in services_data:
+                self._execute_query("INSERT INTO services (name, description, price) VALUES (?, ?, ?)", service)
+            logging.info("Sample service data populated.")
 
     def get_pets(self, query=None, filters=None):
         """Fetches a list of pets, optionally with search query and filters."""
         sql = "SELECT * FROM pets"
         params = []
         where_clauses = []
-
         if query:
             where_clauses.append("(name LIKE ? OR breed LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-
-        if filters:
-            if filters.get('breed'):
-                where_clauses.append("breed = ?")
-                params.append(filters['breed'])
-            if filters.get('age_min') is not None:
-                where_clauses.append("age >= ?")
-                params.append(filters['age_min'])
-            if filters.get('age_max') is not None:
-                where_clauses.append("age <= ?")
-                params.append(filters['age_max'])
-
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
-        
-        cursor = self.conn.cursor()
-        cursor.execute(sql, tuple(params))
-        return [dict(row) for row in cursor.fetchall()]
+        return self._execute_query(sql, tuple(params), fetch='all')
 
     def get_services(self, query=None):
         """Fetches a list of services, optionally with a search query."""
@@ -166,30 +149,13 @@ class DatabaseManager:
         if query:
             sql += " WHERE name LIKE ?"
             params.append(f"%{query}%")
-        
-        cursor = self.conn.cursor()
-        cursor.execute(sql, tuple(params))
-        return [dict(row) for row in cursor.fetchall()]
-
-    def get_pet_by_id(self, pet_id):
-        """Fetches a single pet by its ID."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM pets WHERE id = ?", (pet_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
-
-    def get_service_by_id(self, service_id):
-        """Fetches a single service by its ID."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        return self._execute_query(sql, tuple(params), fetch='all')
 
     def add_user(self, username, email, password):
         """Adds a new user to the database with a hashed password."""
         try:
             password_hash = argon2.hash(password)
-            self._execute_query("INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)", 
+            self._execute_query("INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
                                 (username, email, password_hash))
             logging.info(f"New user {username} added successfully.")
             return True
@@ -199,9 +165,7 @@ class DatabaseManager:
 
     def verify_user(self, username, password):
         """Verifies a user's password against the stored hash."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
-        row = cursor.fetchone()
+        row = self._execute_query("SELECT id, password_hash FROM users WHERE username = ?", (username,), fetch='one')
         if row and argon2.verify(password, row['password_hash']):
             logging.info(f"User {username} authenticated successfully.")
             return row['id']
@@ -210,40 +174,15 @@ class DatabaseManager:
 
     def get_user_by_id(self, user_id):
         """Fetches user details by ID."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
-
-    def add_to_wishlist(self, user_id, pet_id):
-        """Adds a pet to a user's wishlist."""
-        self._execute_query("INSERT OR IGNORE INTO user_wishlist (user_id, pet_id) VALUES (?, ?)", (user_id, pet_id))
-
-    def get_wishlist(self, user_id):
-        """Retrieves a user's wishlist."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT p.* FROM user_wishlist uw JOIN pets p ON uw.pet_id = p.id WHERE uw.user_id = ?", (user_id,))
-        return [dict(row) for row in cursor.fetchall()]
-        
+        return self._execute_query("SELECT id, username, email FROM users WHERE id = ?", (user_id,), fetch='one')
+    
     def add_adopted_pet(self, user_id, pet_id):
         """Adds an adopted pet to a user's history."""
         self._execute_query("INSERT INTO user_adoptions (user_id, pet_id, adoption_date) VALUES (?, ?, date('now'))", (user_id, pet_id))
 
-    def get_adopted_pets(self, user_id):
-        """Retrieves a user's adoption history."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT p.* FROM user_adoptions ua JOIN pets p ON ua.pet_id = p.id WHERE ua.user_id = ?", (user_id,))
-        return [dict(row) for row in cursor.fetchall()]
-
     def add_booking(self, user_id, service_id, booking_date):
         """Adds a service booking to a user's history."""
         self._execute_query("INSERT INTO user_bookings (user_id, service_id, booking_date) VALUES (?, ?, ?)", (user_id, service_id, booking_date))
-
-    def get_user_bookings(self, user_id):
-        """Retrieves a user's booking history."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT s.*, ub.booking_date FROM user_bookings ub JOIN services s ON ub.service_id = s.id WHERE ub.user_id = ?", (user_id,))
-        return [dict(row) for row in cursor.fetchall()]
 
 
 class WishlistManager:
@@ -264,49 +203,37 @@ class WishlistManager:
         with open(self.filename, 'w') as f:
             json.dump(wishlist_ids, f)
 
-class DataWorker(QThread):
+class DataWorker(threading.Thread):
     """
-    Worker thread to perform database operations in the background.
-    This prevents the UI from freezing during I/O operations.
+    Worker thread to perform database operations in the background,
+    preventing the UI from freezing.
     """
-    result_ready = pyqtSignal(str, object)
-    error_occurred = pyqtSignal(str, str)
-
-    def __init__(self, db_manager, operation, **kwargs):
+    def __init__(self, db_manager, operation, result_queue, **kwargs):
         super().__init__()
         self.db = db_manager
         self.operation = operation
         self.kwargs = kwargs
+        self.result_queue = result_queue
+        self.daemon = True # Allows main thread to exit even if worker is running
 
     def run(self):
-        """Executes the requested database operation."""
+        """Executes the requested database operation and puts the result in a queue."""
         try:
+            result = None
             if self.operation == 'get_pets':
-                data = self.db.get_pets(self.kwargs.get('query'), self.kwargs.get('filters'))
-                self.result_ready.emit('pets_list', data)
+                result = self.db.get_pets(self.kwargs.get('query'), self.kwargs.get('filters'))
             elif self.operation == 'get_services':
-                data = self.db.get_services(self.kwargs.get('query'))
-                self.result_ready.emit('services_list', data)
+                result = self.db.get_services(self.kwargs.get('query'))
             elif self.operation == 'verify_user':
-                user_id = self.db.verify_user(self.kwargs['username'], self.kwargs['password'])
-                self.result_ready.emit('auth_result', user_id)
+                result = self.db.verify_user(self.kwargs['username'], self.kwargs['password'])
             elif self.operation == 'add_user':
-                success = self.db.add_user(self.kwargs['username'], self.kwargs['email'], self.kwargs['password'])
-                self.result_ready.emit('signup_result', success)
-            elif self.operation == 'get_wishlist':
-                data = self.db.get_wishlist(self.kwargs['user_id'])
-                self.result_ready.emit('wishlist_result', data)
-            elif self.operation == 'add_to_wishlist':
-                self.db.add_to_wishlist(self.kwargs['user_id'], self.kwargs['pet_id'])
-                self.result_ready.emit('wishlist_updated', True)
-            elif self.operation == 'add_adopted_pet':
-                self.db.add_adopted_pet(self.kwargs['user_id'], self.kwargs['pet_id'])
-                self.result_ready.emit('adoption_completed', True)
-            elif self.operation == 'add_booking':
-                self.db.add_booking(self.kwargs['user_id'], self.kwargs['service_id'], self.kwargs['booking_date'])
-                self.result_ready.emit('booking_completed', True)
+                result = self.db.add_user(self.kwargs['username'], self.kwargs['email'], self.kwargs['password'])
+            
+            # Put the result and operation type into the queue for the main thread
+            self.result_queue.put((self.operation, result))
             
         except Exception as e:
             logging.error(f"Error in DataWorker thread: {e}")
-            self.error_occurred.emit(self.operation, str(e))
-      
+            self.result_queue.put((self.operation, e))
+        finally:
+            self.db.close_conn()
