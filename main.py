@@ -4,8 +4,8 @@
 import sys
 import os
 import logging
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QIcon
+import customtkinter as ctk
+from tkinter import messagebox
 from models import DatabaseManager, WishlistManager
 from views import MainView
 from controllers import AppController
@@ -17,47 +17,50 @@ def setup_resources():
     """Create placeholder directories and assets if they don't exist."""
     if not os.path.exists('assets'):
         os.makedirs('assets')
-    # Create empty placeholder files to avoid errors
+        logging.info("Created 'assets' directory.")
+    
+    # Create empty placeholder image files to prevent errors on first run
     for i in range(1, 11):
-        if not os.path.exists(f"assets/p{i}.jpg"):
-            with open(f"assets/p{i}.jpg", 'w') as f:
-                pass
-    logging.info("Assets directory and placeholder files checked.")
+        filepath = f"assets/p{i}.jpg"
+        if not os.path.exists(filepath):
+            try:
+                from PIL import Image
+                # Create a small blank image
+                img = Image.new('RGB', (100, 100), color = 'gray')
+                img.save(filepath)
+            except ImportError:
+                 # If Pillow is not installed, create an empty file
+                with open(filepath, 'w') as f:
+                    pass
+    logging.info("Assets directory and placeholder files checked/created.")
 
 def main():
     """Main function to run the application."""
     setup_resources()
     
-    app = QApplication(sys.argv)
-    app.setApplicationName("OnlyPets")
+    # Set CustomTkinter appearance
+    ctk.set_appearance_mode("Light")
+    ctk.set_default_color_theme("blue")
     
-    # Check for font (Inter) availability and fallback
-    font = app.font()
-    if not font.family() == 'Inter':
-        logging.warning("Font 'Inter' not found. Using system default.")
-
-    # Try to connect to the database
+    # Initialize database
     db_manager = DatabaseManager()
-    if not db_manager.connect():
-        msg_box = QMessageBox()
-        msg_box.setWindowTitle("Error")
-        msg_box.setText("Failed to connect to the database. The application cannot start.")
-        msg_box.setIcon(QMessageBox.Icon.Critical)
-        msg_box.exec()
-        sys.exit(-1)
+    try:
+        # The connection is now managed per-thread, so we just initialize it here.
+        db_manager.create_tables()
+        db_manager.populate_sample_data()
+        db_manager.close_conn() # Close the main thread's initial connection
+    except Exception as e:
+        messagebox.showerror("Database Error", f"Failed to initialize the database: {e}")
+        sys.exit(1)
         
-    db_manager.create_tables()
-    db_manager.populate_sample_data()
-    
     wishlist_manager = WishlistManager()
     
+    # Initialize MVC components
     main_view = MainView()
     controller = AppController(main_view, db_manager, wishlist_manager)
     
-    main_view.show()
-    
-    sys.exit(app.exec())
+    # Start the main event loop
+    main_view.mainloop()
 
 if __name__ == '__main__':
     main()
-  
